@@ -25,6 +25,9 @@ func executeCommandC(root *cobra.Command, args ...string) (c *cobra.Command, out
 
 	c, err = root.ExecuteC()
 
+	// Resets args for the next test run to avoid arguments for flags being carried over
+	root.SetArgs([]string{})
+
 	return c, buf.String(), err
 }
 
@@ -109,4 +112,14 @@ func TestReadProjectFlagHasPrecedence(t *testing.T) {
 	executeCommand(rootCmd, "version", "--project-name", "from-flag")
 
 	require.Equal(t, Config.Profile.ProfileName, "from-flag")
+}
+
+func TestV2BillingOverrides(t *testing.T) {
+	Execute(context.Background())
+
+	output, err := executeCommand(rootCmd, "billing")
+
+	require.Contains(t, output, "meter_event_session")
+	require.Contains(t, output, "meter_event_stream")
+	require.NoError(t, err)
 }

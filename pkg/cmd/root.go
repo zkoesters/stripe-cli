@@ -13,6 +13,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
 	"github.com/stripe/stripe-cli/pkg/cmd/resource"
@@ -60,6 +61,13 @@ var rootCmd = &cobra.Command{
 			telemetryMetadata.SetCobraCommandContext(cmd)
 			telemetryMetadata.SetMerchant(merchant)
 			telemetryMetadata.SetUserAgent(useragent.GetEncodedUserAgent())
+
+			flags := []string{}
+			cmd.Flags().Visit(func(flag *pflag.Flag) {
+				flags = append(flags, flag.Name)
+			})
+			flagsStr := strings.Join(flags, ",")
+			telemetryMetadata.SetCommandFlags(flagsStr)
 		}
 
 		// plugins send their own telemetry due to having richer context than the CLI does
@@ -204,6 +212,7 @@ func init() {
 	rootCmd.AddCommand(newCommunityCmd().cmd)
 	rootCmd.AddCommand(newPluginCmd().cmd)
 	addAllResourcesCmds(rootCmd)
+	addV2BillingStubs(rootCmd)
 
 	err := resource.PostProcessResourceCommands(rootCmd, &Config)
 	if err != nil {
@@ -224,4 +233,16 @@ func init() {
 			rootCmd.AddCommand(newPluginTemplateCmd(&Config, &plugin).cmd)
 		}
 	}
+}
+
+func addV2BillingStubs(rootCmd *cobra.Command) {
+	cmd, _, err := rootCmd.Find([]string{"billing"})
+	if err != nil {
+		// silently fail
+		return
+	}
+	rBillingMeterEventSessionCmd := resource.NewResourceCmd(cmd, "meter_event_session")
+	rBillingMeterEventStreamCmd := resource.NewResourceCmd(cmd, "meter_event_stream")
+	resource.NewUnsupportedV2BillingOperationCmd(rBillingMeterEventSessionCmd.Cmd, "create", "/v2/billing/meter_event_session")
+	resource.NewUnsupportedV2BillingOperationCmd(rBillingMeterEventStreamCmd.Cmd, "create", "/v2/billing/meter_event_stream")
 }

@@ -23,18 +23,24 @@ import (
 	"github.com/stripe/stripe-cli/pkg/websocket"
 )
 
-const webhooksWebSocketFeature = "webhooks"
-const timeLayout = "2006-01-02 15:04:05"
-const outputFormatJSON = "JSON"
+const (
+	webhooksWebSocketFeature     = "webhooks"
+	destinationsWebSocketFeature = "v2_events"
+	timeLayout                   = "2006-01-02 15:04:05"
+	outputFormatJSON             = "JSON"
+)
 
 type listenCmd struct {
 	cmd *cobra.Command
 
 	forwardURL            string
+	forwardThinURL        string
 	forwardHeaders        []string
 	forwardConnectHeaders []string
 	forwardConnectURL     string
+	forwardThinConnectURL string
 	events                []string
+	thinEvents            []string
 	latestAPIVersion      bool
 	livemode              bool
 	useConfiguredWebhooks bool
@@ -46,6 +52,7 @@ type listenCmd struct {
 	apiBaseURL            string
 	noWSS                 bool
 	timeout               int64
+	deviceToken           string
 }
 
 func newListenCmd() *listenCmd {
@@ -61,7 +68,9 @@ API version, filter events, or even load your saved webhook endpoints from your
 Stripe account.`,
 		Example: `stripe listen
   stripe listen --events charge.captured,charge.updated \
-    --forward-to localhost:3000/events`,
+    --forward-to localhost:3000/events
+  stripe listen --thin-events v1.billing.meter.no_meter_found \
+    --forward-thin-to localhost:3000/thin-events`,
 		RunE: lc.runListenCmd,
 	}
 
@@ -70,6 +79,9 @@ Stripe account.`,
 	lc.cmd.Flags().StringVarP(&lc.forwardURL, "forward-to", "f", "", "The URL to forward webhook events to")
 	lc.cmd.Flags().StringSliceVarP(&lc.forwardHeaders, "headers", "H", []string{}, "A comma-separated list of custom headers to forward. Ex: \"Key1:Value1, Key2:Value2\"")
 	lc.cmd.Flags().StringVarP(&lc.forwardConnectURL, "forward-connect-to", "c", "", "The URL to forward Connect webhook events to (default: same as normal events)")
+	lc.cmd.Flags().StringSliceVar(&lc.thinEvents, "thin-events", []string{}, "A comma-separated list of thin events to listen for.")
+	lc.cmd.Flags().StringVar(&lc.forwardThinURL, "forward-thin-to", "", "The URL to forward thin events to")
+	lc.cmd.Flags().StringVar(&lc.forwardThinConnectURL, "forward-thin-connect-to", "", "The URL to forward thin Connect events to")
 	lc.cmd.Flags().BoolVarP(&lc.latestAPIVersion, "latest", "l", false, "Receive events formatted with the latest API version (default: your account's default API version)")
 	lc.cmd.Flags().BoolVar(&lc.livemode, "live", false, "Receive live events (default: test)")
 	lc.cmd.Flags().BoolVarP(&lc.printJSON, "print-json", "j", false, "Print full JSON objects to stdout.")
@@ -106,6 +118,10 @@ Stripe account.`,
 // Normally, this function would be listed alphabetically with the others declared in this file,
 // but since it's acting as the core functionality for the cmd above, I'm keeping it close.
 func (lc *listenCmd) runListenCmd(cmd *cobra.Command, args []string) error {
+	if err := stripe.ValidateAPIBaseURL(lc.apiBaseURL); err != nil {
+		return err
+	}
+
 	if !lc.printJSON && !lc.onlyPrintSecret && !lc.skipUpdate {
 		version.CheckLatestVersion()
 	}
@@ -146,18 +162,21 @@ func (lc *listenCmd) runListenCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	logger := log.StandardLogger()
-	proxyVisitor := createVisitor(logger, lc.format, lc.printJSON)
+	proxyVisitor := lc.createVisitor(logger, lc.format, lc.printJSON)
 	proxyOutCh := make(chan websocket.IElement)
 
 	p, err := proxy.Init(ctx, &proxy.Config{
 		Client:                client,
 		DeviceName:            deviceName,
+		DeviceToken:           &lc.deviceToken,
 		ForwardURL:            lc.forwardURL,
+		ForwardThinURL:        lc.forwardThinURL,
 		ForwardHeaders:        lc.forwardHeaders,
 		ForwardConnectURL:     lc.forwardConnectURL,
+		ForwardThinConnectURL: lc.forwardThinConnectURL,
 		ForwardConnectHeaders: lc.forwardConnectHeaders,
 		UseConfiguredWebhooks: lc.useConfiguredWebhooks,
-		WebSocketFeature:      webhooksWebSocketFeature,
+		WebSocketFeatures:     lc.getFeatures(),
 		PrintJSON:             lc.printJSON,
 		UseLatestAPIVersion:   lc.latestAPIVersion,
 		SkipVerify:            lc.skipVerify,
@@ -165,6 +184,7 @@ func (lc *listenCmd) runListenCmd(cmd *cobra.Command, args []string) error {
 		NoWSS:                 lc.noWSS,
 		Timeout:               lc.timeout,
 		Events:                lc.events,
+		ThinEvents:            lc.thinEvents,
 		OutCh:                 proxyOutCh,
 	})
 	if err != nil {
@@ -198,7 +218,7 @@ func withSIGTERMCancel(ctx context.Context, onCancel func()) context.Context {
 	return ctx
 }
 
-func createVisitor(logger *log.Logger, format string, printJSON bool) *websocket.Visitor {
+func (lc *listenCmd) createVisitor(logger *log.Logger, format string, printJSON bool) *websocket.Visitor {
 	var s *spinner.Spinner
 
 	return &websocket.Visitor{
@@ -251,6 +271,28 @@ func createVisitor(logger *log.Logger, format string, printJSON bool) *websocket
 		},
 		VisitData: func(de websocket.DataElement) error {
 			switch data := de.Data.(type) {
+			case proxy.V2EventPayload:
+				if strings.ToUpper(format) == outputFormatJSON || printJSON {
+					fmt.Println(de.Marshaled)
+					return nil
+				}
+
+				maybeConnect := ""
+				if data.IsConnect() {
+					maybeConnect = "connect "
+				}
+
+				localTime := time.Now().Format(timeLayout)
+
+				color := ansi.Color(os.Stdout)
+				outputStr := fmt.Sprintf("%s   --> %s%s [%s]",
+					color.Faint(localTime),
+					color.BrightBlue(maybeConnect),
+					ansi.Bold(data.Type),
+					ansi.Linkify(data.ID, data.URLForEventID(lc.deviceToken), logger.Out),
+				)
+				fmt.Println(outputStr)
+				return nil
 			case proxy.StripeEvent:
 				if strings.ToUpper(format) == outputFormatJSON || printJSON {
 					fmt.Println(de.Marshaled)
@@ -265,7 +307,7 @@ func createVisitor(logger *log.Logger, format string, printJSON bool) *websocket
 					color := ansi.Color(os.Stdout)
 					outputStr := fmt.Sprintf("%s   --> %s%s [%s]",
 						color.Faint(localTime),
-						maybeConnect,
+						color.BrightBlue(maybeConnect),
 						ansi.Linkify(ansi.Bold(data.Type), data.URLForEventType(), logger.Out),
 						ansi.Linkify(data.ID, data.URLForEventID(), logger.Out),
 					)
@@ -275,6 +317,13 @@ func createVisitor(logger *log.Logger, format string, printJSON bool) *websocket
 			case proxy.EndpointResponse:
 				event := data.Event
 				resp := data.Resp
+				v2Event := data.V2Event
+				var link string
+				if event != nil {
+					link = ansi.Linkify(event.ID, event.URLForEventID(), logger.Out)
+				} else if v2Event != nil {
+					link = ansi.Linkify(v2Event.ID, v2Event.URLForEventID(lc.deviceToken), logger.Out)
+				}
 				localTime := time.Now().Format(timeLayout)
 
 				color := ansi.Color(os.Stdout)
@@ -283,7 +332,7 @@ func createVisitor(logger *log.Logger, format string, printJSON bool) *websocket
 					ansi.ColorizeStatus(resp.StatusCode),
 					resp.Request.Method,
 					resp.Request.URL,
-					ansi.Linkify(event.ID, event.URLForEventID(), logger.Out),
+					link,
 				)
 				fmt.Println(outputStr)
 				return nil
@@ -292,4 +341,18 @@ func createVisitor(logger *log.Logger, format string, printJSON bool) *websocket
 			}
 		},
 	}
+}
+
+func (lc *listenCmd) getFeatures() []string {
+	features := []string{}
+
+	if len(lc.events) > 0 {
+		features = append(features, webhooksWebSocketFeature)
+	}
+
+	if len(lc.thinEvents) > 0 {
+		features = append(features, destinationsWebSocketFeature)
+	}
+
+	return features
 }

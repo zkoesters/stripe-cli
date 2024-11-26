@@ -3,6 +3,7 @@ package resource
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/config"
 	"github.com/stripe/stripe-cli/pkg/requests"
+	"github.com/stripe/stripe-cli/pkg/stripe"
 	"github.com/stripe/stripe-cli/pkg/validators"
 )
 
@@ -39,6 +41,10 @@ type OperationCmd struct {
 }
 
 func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error {
+	if err := stripe.ValidateAPIBaseURL(oc.APIBaseURL); err != nil {
+		return err
+	}
+
 	apiKey, err := oc.Profile.GetAPIKey(oc.Livemode)
 	if err != nil {
 		return err
@@ -106,6 +112,10 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 		if displayName != "" {
 			fmt.Printf("> Account Name: %s\n", displayName)
 		}
+		if strings.HasPrefix(path, "/v1/accounts/") {
+			connectedAccountID := strings.Split(path, "/")[3]
+			fmt.Printf("> Connected Account: %s\n", connectedAccountID)
+		}
 
 		// call the confirm command from base request
 		confirmation, err := oc.Confirm()
@@ -117,18 +127,38 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 		}
 
 		// if confirmation is provided, make the request
-		_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false)
+		_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false, nil)
 
 		return err
 	}
 	// else
-	_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false)
+	_, err = oc.MakeRequest(cmd.Context(), apiKey, path, &oc.Parameters, false, nil)
 	return err
 }
 
 //
 // Public functions
 //
+
+// NewUnsupportedV2BillingOperationCmd returns a new cobra command for an unsupported v2 billing command.
+// This is temporary until resource commands support the /v2/billing namespace.
+func NewUnsupportedV2BillingOperationCmd(parentCmd *cobra.Command, name string, path string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:         name,
+		Annotations: make(map[string]string),
+		Run: func(cmd *cobra.Command, args []string) {
+			output := `
+%s is not supported by Stripe CLI yet. Please use the %s or cURL to create a %s, instead.
+
+* Hint: If you're trying to test webhook events, you can always use %s or %s.
+			`
+
+			fmt.Println(fmt.Sprintf(output, ansi.Bold(path), ansi.Linkify("Dashboard", "https://dashboard.stripe.com", os.Stdout), parentCmd.Name(), ansi.Bold("stripe trigger v1.billing.meter.no_meter_found"), ansi.Bold("stripe trigger v1.billing.meter.error_report_triggered")))
+		},
+	}
+	parentCmd.AddCommand(cmd)
+	return cmd
+}
 
 // NewOperationCmd returns a new OperationCmd.
 func NewOperationCmd(parentCmd *cobra.Command, name, path, httpVerb string, propFlags map[string]string, cfg *config.Config) *OperationCmd {

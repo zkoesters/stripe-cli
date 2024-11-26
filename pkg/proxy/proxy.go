@@ -43,12 +43,16 @@ type EndpointRoute struct {
 
 	// Status is whether or not the endpoint is enabled.
 	Status string
+
+	// IsEventDestination indicates whether this is a Thin endpoint
+	IsEventDestination bool
 }
 
 // EndpointResponse describes the response to a Stripe event from an endpoint
 type EndpointResponse struct {
-	Event *StripeEvent
-	Resp  *http.Response
+	Event   *StripeEvent
+	V2Event *V2EventPayload
+	Resp    *http.Response
 }
 
 // FailedToReadResponseError describes a failure to read the response from an endpoint
@@ -63,17 +67,22 @@ func (f FailedToReadResponseError) Error() string {
 // Config provides the configuration of a Proxy
 type Config struct {
 	// DeviceName is the name of the device sent to Stripe to help identify the device
-	DeviceName string
+	DeviceName  string
+	DeviceToken *string
 
 	// Client is a configured stripe client used to execute authenticated calls to the Stripe API.
 	Client stripe.RequestPerformer
 
 	// URL to which events are forwarded to
 	ForwardURL string
+	// URL to which Thin events are forwarded to
+	ForwardThinURL string
 	// Headers to inject when forwarding events
 	ForwardHeaders []string
 	// URL to which Connect events are forwarded to
 	ForwardConnectURL string
+	// URL to which Connect Thin events are forwarded to
+	ForwardThinConnectURL string
 	// Headers to inject when forwarding Connect events
 	ForwardConnectHeaders []string
 	// UseConfiguredWebhooks loads webhooks config from user's account
@@ -81,9 +90,11 @@ type Config struct {
 
 	// List of events to listen and proxy
 	Events []string
+	// List of Thin-type events to listen and proxy
+	ThinEvents []string
 
-	// WebSocketFeature is the feature specified for the websocket connection
-	WebSocketFeature string
+	// WebSocketFeatures is the feature specified for the websocket connection
+	WebSocketFeatures []string
 	// Indicates whether to print full JSON objects to stdout
 	PrintJSON bool
 
@@ -146,7 +157,6 @@ func (p *Proxy) Run(ctx context.Context) error {
 
 	for nAttempts < maxConnectAttempts {
 		session, err := p.createSession(ctx)
-
 		if err != nil {
 			p.cfg.OutCh <- websocket.ErrorElement{
 				Error: fmt.Errorf("Error while authenticating with Stripe: %v", err),
@@ -154,6 +164,7 @@ func (p *Proxy) Run(ctx context.Context) error {
 			return err
 		}
 
+		*p.cfg.DeviceToken = session.DeviceToken
 		p.webSocketClient = websocket.NewClient(
 			session.WebSocketURL,
 			session.WebSocketID,
@@ -221,9 +232,9 @@ func (p *Proxy) Run(ctx context.Context) error {
 // GetSessionSecret creates a session and returns the webhook signing secret.
 func GetSessionSecret(ctx context.Context, client stripe.RequestPerformer, deviceName string) (string, error) {
 	p, err := Init(ctx, &Config{
-		Client:           client,
-		DeviceName:       deviceName,
-		WebSocketFeature: "webhooks",
+		Client:            client,
+		DeviceName:        deviceName,
+		WebSocketFeatures: []string{"webhooks"},
 	})
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -255,13 +266,15 @@ func (p *Proxy) createSession(ctx context.Context) (*stripeauth.StripeCLISession
 		// transient errors that we just need to retry for.
 		for i := 0; i <= 5; i++ {
 			devURLMap := stripeauth.DeviceURLMap{
-				ForwardURL:        p.cfg.ForwardURL,
-				ForwardConnectURL: p.cfg.ForwardConnectURL,
+				ForwardURL:            p.cfg.ForwardURL,
+				ForwardConnectURL:     p.cfg.ForwardConnectURL,
+				ForwardThinURL:        p.cfg.ForwardThinURL,
+				ForwardThinConnectURL: p.cfg.ForwardThinConnectURL,
 			}
 
 			session, err = p.stripeAuthClient.Authorize(ctx, stripeauth.CreateSessionRequest{
 				DeviceName:        p.cfg.DeviceName,
-				WebSocketFeatures: []string{p.cfg.WebSocketFeature},
+				WebSocketFeatures: p.cfg.WebSocketFeatures,
 				DeviceURLMap:      &devURLMap,
 			})
 
@@ -336,12 +349,24 @@ func Init(ctx context.Context, cfg *Config) (*Proxy, error) {
 		}
 	}
 
+	if len(cfg.ThinEvents) > 0 {
+		for _, event := range cfg.ThinEvents {
+			if _, found := validThinEvents[event]; !found {
+				cfg.Log.Infof("Warning: You're attempting to listen for \"%s\", which isn't a valid thin event\n", event)
+			}
+		}
+	}
+
 	// build from --forward-to urls if --forward-connect-to was not provided
 	if len(cfg.ForwardConnectURL) == 0 {
 		cfg.ForwardConnectURL = cfg.ForwardURL
 	}
 	if len(cfg.ForwardConnectHeaders) == 0 {
 		cfg.ForwardConnectHeaders = cfg.ForwardHeaders
+	}
+
+	if len(cfg.ForwardThinConnectURL) == 0 {
+		cfg.ForwardThinConnectURL = cfg.ForwardThinURL
 	}
 
 	// build endpoint routes
@@ -377,11 +402,34 @@ func Init(ctx context.Context, cfg *Config) (*Proxy, error) {
 				EventTypes:     cfg.Events,
 			})
 		}
+
+		if len(cfg.ForwardThinURL) > 0 {
+			// Thin endpoints
+			endpointRoutes = append(endpointRoutes, EndpointRoute{
+				URL:                parseURL(cfg.ForwardThinURL),
+				ForwardHeaders:     cfg.ForwardHeaders,
+				Connect:            false,
+				EventTypes:         cfg.ThinEvents,
+				IsEventDestination: true,
+			})
+		}
+
+		if len(cfg.ForwardThinConnectURL) > 0 {
+			// Thin connect endpoints
+			endpointRoutes = append(endpointRoutes, EndpointRoute{
+				URL:                parseURL(cfg.ForwardThinConnectURL),
+				ForwardHeaders:     cfg.ForwardConnectHeaders,
+				Connect:            true,
+				EventTypes:         cfg.ThinEvents,
+				IsEventDestination: true,
+			})
+		}
 	}
 
 	processorConfig := &WebhookEventProcessorConfig{
 		Log:                 cfg.Log,
 		Events:              cfg.Events,
+		ThinEvents:          cfg.ThinEvents,
 		OutCh:               cfg.OutCh,
 		UseLatestAPIVersion: cfg.UseLatestAPIVersion,
 		SkipVerify:          cfg.SkipVerify,
@@ -436,7 +484,10 @@ func ExtractRequestData(data interface{}) (StripeRequest, error) {
 type eventContext struct {
 	webhookID             string
 	webhookConversationID string
+	requestBody           string
+	requestHeaders        map[string]string
 	event                 *StripeEvent
+	v2Event               *V2EventPayload
 }
 
 //
